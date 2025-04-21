@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.DS_Store
+*.vscode/
+*.code-workspace
+*.log
+*.bat
+
+
+ref/
+testing/
+documentation/
+deprecated/
+image files/
