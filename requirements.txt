@@ -11,3 +11,6 @@ OpenImageIO>=2.4.13.0
 
 # Optional: Logging and Debugging
 rich>=10.0.0
+
+# Networking
+requests>=2.31.0
