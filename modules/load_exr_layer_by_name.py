@@ -2,6 +2,49 @@ import torch
 import logging
 from typing import Dict, List, Union, Any
 
+# Import tone mapping functions from load_exr
+try:
+    from .load_exr import _apply_tonemap, _linear_to_srgb_inplace
+except ImportError:
+    # Fallback implementations if import fails
+    def _linear_to_srgb_inplace(t: torch.Tensor) -> None:
+        """Convert linear RGB to sRGB in-place for tensors in [B, H, W, 3] or [H, W, 3]."""
+        less = t <= 0.0031308
+        t[less] = t[less] * 12.92
+        t[~less] = torch.pow(t[~less].clamp(min=0.0), 1.0 / 2.4) * 1.055 - 0.055
+    
+    def _apply_tonemap(rgb: torch.Tensor, tonemap: str, exposure_stops: float = 0.0) -> torch.Tensor:
+        """Apply exposure and tonemapping to HDR/EXR data."""
+        if rgb is None:
+            return rgb
+        
+        # Apply exposure first
+        if exposure_stops != 0.0:
+            exposure_multiplier = 2.0 ** exposure_stops
+            rgb = rgb * exposure_multiplier
+        
+        if tonemap == "sRGB":
+            out = rgb.clone()
+            _linear_to_srgb_inplace(out)
+            return out.clamp(0.0, 1.0)
+        elif tonemap == "Reinhard":
+            out = rgb.clamp(min=0.0)
+            out = out / (out + 1.0)
+            _linear_to_srgb_inplace(out)
+            return out.clamp(0.0, 1.0)
+        elif tonemap == "ACES":
+            # Simple ACES-like tone mapping
+            out = rgb.clamp(min=0.0)
+            a = 2.51
+            b = 0.03
+            c = 2.43
+            d = 0.59
+            e = 0.14
+            out = (out * (a * out + b)) / (out * (c * out + d) + e)
+            return out.clamp(0.0, 1.0)
+        # "linear" or anything else: return with exposure applied but no tone curve
+        return rgb
+
 # Import centralized logging setup
 try:
     from ..utils.debug_utils import setup_logging
@@ -59,6 +102,10 @@ class LoadExrLayerByName:
                     "max": 10.0,
                     "step": 0.1,
                     "description": "Exposure adjustment in stops (powers of 2)"
+                }),
+                "tonemap": (["linear", "sRGB", "Reinhard", "ACES"], {
+                    "default": "linear",
+                    "description": "Tone mapping method to apply to the layer"
                 })
             }
         }
@@ -73,7 +120,8 @@ class LoadExrLayerByName:
         return float("NaN")  # Always execute
     
     def process_layer(self, layers: Dict[str, torch.Tensor], layer_name: str, 
-                     conversion: str = "Auto", exposure_stops: float = 0.0) -> List[Union[torch.Tensor, None]]:
+                     conversion: str = "Auto", exposure_stops: float = 0.0, 
+                     tonemap: str = "linear") -> List[Union[torch.Tensor, None]]:
         """
         Extract a specific layer from the layers dictionary.
         
@@ -82,6 +130,7 @@ class LoadExrLayerByName:
             layer_name: Name of the layer to extract
             conversion: How to convert the layer (Auto, To RGB, To Mask)
             exposure_stops: Exposure adjustment in stops (powers of 2)
+            tonemap: Tone mapping method (linear, sRGB, Reinhard, ACES)
             
         Returns:
             List containing [image, mask] tensors
@@ -158,11 +207,6 @@ class LoadExrLayerByName:
         # Get the requested layer
         layer_tensor = layers[layer_name]
         
-        # Apply exposure adjustment if specified
-        if exposure_stops != 0.0:
-            exposure_multiplier = 2.0 ** exposure_stops
-            layer_tensor = layer_tensor * exposure_multiplier
-        
         # Log the layer processing
         debug_log(logger, "info", f"Processing layer '{layer_name}'", 
                  f"Processing layer '{layer_name}' with shape {layer_tensor.shape} and type {layer_tensor.dtype}")
@@ -182,8 +226,8 @@ class LoadExrLayerByName:
                 image_output = None
                 debug_log(logger, "info", "Converted to mask", f"Converted RGB tensor to mask: shape={mask_output.shape}")
             else:
-                # Keep as an image
-                image_output = layer_tensor
+                # Apply tone mapping to RGB layers
+                image_output = _apply_tonemap(layer_tensor, tonemap, exposure_stops)
                 mask_output = None
                 debug_log(logger, "info", "Using as RGB image", f"Using RGB tensor as image: shape={image_output.shape}")
         elif len(layer_tensor.shape) == 3:
@@ -193,12 +237,14 @@ class LoadExrLayerByName:
             
             if conversion == "To RGB":
                 # Convert to RGB by replicating to 3 channels
-                image_output = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                rgb_layer = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                image_output = _apply_tonemap(rgb_layer, tonemap, exposure_stops)
                 mask_output = None
                 debug_log(logger, "info", "Converted to RGB", f"Converted single-channel tensor to RGB: shape={image_output.shape}")
             elif is_depth_or_z:
                 # For depth and Z channels, return as image by default
-                image_output = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                rgb_layer = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                image_output = _apply_tonemap(rgb_layer, tonemap, exposure_stops)
                 mask_output = None
                 debug_log(logger, "info", "Converted depth to RGB", f"Converted depth/Z tensor to RGB: shape={image_output.shape}")
             elif 'alpha' in layer_name.lower():
@@ -214,7 +260,8 @@ class LoadExrLayerByName:
                     debug_log(logger, "info", "Using as mask", f"Using single-channel tensor as mask: shape={mask_output.shape}")
                 else:
                     # Default to RGB for Auto mode for non-alpha channels
-                    image_output = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                    rgb_layer = torch.cat([layer_tensor.unsqueeze(3)] * 3, dim=3)
+                    image_output = _apply_tonemap(rgb_layer, tonemap, exposure_stops)
                     mask_output = None
                     debug_log(logger, "info", "Using as RGB (Auto)", f"Using single-channel tensor as RGB (Auto): shape={image_output.shape}")
         # Special case for empty tensors or tensors with shape [1, 1, 1, 3]
