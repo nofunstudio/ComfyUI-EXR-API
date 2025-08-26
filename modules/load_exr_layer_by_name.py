@@ -52,6 +52,13 @@ class LoadExrLayerByName:
             "optional": {
                 "conversion": (["Auto", "To RGB", "To Mask"], {
                     "default": "Auto"
+                }),
+                "exposure_stops": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -10.0,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "description": "Exposure adjustment in stops (powers of 2)"
                 })
             }
         }
@@ -66,7 +73,7 @@ class LoadExrLayerByName:
         return float("NaN")  # Always execute
     
     def process_layer(self, layers: Dict[str, torch.Tensor], layer_name: str, 
-                     conversion: str = "Auto") -> List[Union[torch.Tensor, None]]:
+                     conversion: str = "Auto", exposure_stops: float = 0.0) -> List[Union[torch.Tensor, None]]:
         """
         Extract a specific layer from the layers dictionary.
         
@@ -74,6 +81,7 @@ class LoadExrLayerByName:
             layers: Dictionary of layer names to tensors
             layer_name: Name of the layer to extract
             conversion: How to convert the layer (Auto, To RGB, To Mask)
+            exposure_stops: Exposure adjustment in stops (powers of 2)
             
         Returns:
             List containing [image, mask] tensors
@@ -149,6 +157,11 @@ class LoadExrLayerByName:
         
         # Get the requested layer
         layer_tensor = layers[layer_name]
+        
+        # Apply exposure adjustment if specified
+        if exposure_stops != 0.0:
+            exposure_multiplier = 2.0 ** exposure_stops
+            layer_tensor = layer_tensor * exposure_multiplier
         
         # Log the layer processing
         debug_log(logger, "info", f"Processing layer '{layer_name}'", 

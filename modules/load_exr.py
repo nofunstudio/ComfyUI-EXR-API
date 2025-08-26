@@ -40,24 +40,48 @@ def _linear_to_srgb_inplace(t: torch.Tensor) -> None:
     t[~less] = torch.pow(t[~less].clamp(min=0.0), 1.0 / 2.4) * 1.055 - 0.055
 
 
-def _apply_tonemap(rgb: torch.Tensor, tonemap: str) -> torch.Tensor:
+def _apply_exposure(rgb: torch.Tensor, exposure_stops: float) -> torch.Tensor:
     """
-    Apply optional tonemapping similar to ComfyDeploy External EXR node.
+    Apply exposure adjustment in stops (powers of 2).
+    Expects and returns [1, H, W, 3] float32 tensor.
+    """
+    if rgb is None or exposure_stops == 0.0:
+        return rgb
+    exposure_multiplier = 2.0 ** exposure_stops
+    return rgb * exposure_multiplier
+
+
+def _apply_tonemap(rgb: torch.Tensor, tonemap: str, exposure_stops: float = 0.0) -> torch.Tensor:
+    """
+    Apply exposure and tonemapping to HDR/EXR data.
     Expects and returns [1, H, W, 3] float32 tensor.
     """
     if rgb is None:
         return rgb
+    
+    # Apply exposure first
+    out = _apply_exposure(rgb, exposure_stops)
+    
     if tonemap == "sRGB":
-        out = rgb.clone()
         _linear_to_srgb_inplace(out)
         return out.clamp(0.0, 1.0)
-    if tonemap == "Reinhard":
-        out = rgb.clamp(min=0.0)
+    elif tonemap == "Reinhard":
+        out = out.clamp(min=0.0)
         out = out / (out + 1.0)
         _linear_to_srgb_inplace(out)
         return out.clamp(0.0, 1.0)
-    # "linear" or anything else: no-op
-    return rgb
+    elif tonemap == "ACES":
+        # Simple ACES-like tone mapping
+        out = out.clamp(min=0.0)
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        out = (out * (a * out + b)) / (out * (c * out + d) + e)
+        return out.clamp(0.0, 1.0)
+    # "linear" or anything else: return with exposure applied but no tone curve
+    return out
 
 
 class LoadExr:
@@ -78,7 +102,14 @@ class LoadExr:
                 # ComfyDeploy External EXR-compatible inputs
                 "input_id": ("STRING", {"multiline": False, "default": "input_exr"}),
                 "exr_file": ("STRING", {"default": ""}),  # URL or local path
-                "tonemap": (["linear", "sRGB", "Reinhard"], {"default": "sRGB"}),
+                "tonemap": (["linear", "sRGB", "Reinhard", "ACES"], {"default": "linear"}),
+                "exposure_stops": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -10.0,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "description": "Exposure adjustment in stops (powers of 2)"
+                }),
                 "default_image": ("IMAGE",),
                 "default_mask": ("MASK",),
                 "display_name": ("STRING", {"multiline": False, "default": ""}),
@@ -112,13 +143,13 @@ class LoadExr:
             if exr_file and os.path.isfile(get_annotated_filepath(exr_file)):
                 path = get_annotated_filepath(exr_file)
                 stat = os.stat(path)
-                return f"{path}_{stat.st_mtime}_{stat.st_size}_{normalize}_{tonemap}"
+                return f"{path}_{stat.st_mtime}_{stat.st_size}_{normalize}_{tonemap}_{kwargs.get('exposure_stops', 0.0)}"
             if not os.path.isfile(image_path):
                 return float("NaN")  # File doesn't exist, always try to load
             
             stat = os.stat(image_path)
             # Create hash from file path, modification time, size, and normalize parameter
-            return f"{image_path}_{stat.st_mtime}_{stat.st_size}_{normalize}_{tonemap}"
+            return f"{image_path}_{stat.st_mtime}_{stat.st_size}_{normalize}_{tonemap}_{kwargs.get('exposure_stops', 0.0)}"
         except Exception:
             # If we can't access file info, always try to load
             return float("NaN")
@@ -142,7 +173,8 @@ class LoadExr:
 
         # External EXR compatible params
         exr_file: str = kwargs.get("exr_file", "") or ""
-        tonemap: str = kwargs.get("tonemap", "sRGB")
+        tonemap: str = kwargs.get("tonemap", "linear")
+        exposure_stops: float = kwargs.get("exposure_stops", 0.0)
         default_image = kwargs.get("default_image", None)
         default_mask = kwargs.get("default_mask", None)
         input_id: str = kwargs.get("input_id", "input_exr")
@@ -178,6 +210,7 @@ class LoadExr:
                         "display_name": display_name,
                         "description": description,
                         "tonemap": tonemap,
+                        "exposure_stops": exposure_stops,
                         "external_used": used_external,
                     }
                     return [
@@ -203,9 +236,9 @@ class LoadExr:
                 rgb_tensor, alpha_tensor, cryptomatte, layers, processed_names, raw_names, metadata_json = result
                 ui_part = None
 
-            # Optionally tonemap base RGB like External EXR node (does not affect layers)
-            if 'used_external' in locals() and used_external:
-                rgb_tensor = _apply_tonemap(rgb_tensor, tonemap)
+            # Apply exposure and tone mapping to base RGB (does not affect individual layers)
+            # Always apply tone mapping for consistency, regardless of source
+            rgb_tensor = _apply_tonemap(rgb_tensor, tonemap, exposure_stops)
 
             # Enrich metadata with external fields
             try:
@@ -220,6 +253,7 @@ class LoadExr:
                     "display_name": display_name,
                     "description": description,
                     "tonemap": tonemap,
+                    "exposure_stops": exposure_stops,
                     "external_used": used_external,
                     "exr_file_param": exr_file,
                 }
@@ -248,6 +282,7 @@ class LoadExr:
                     "error": str(e),
                     "input_id": input_id,
                     "tonemap": tonemap,
+                    "exposure_stops": exposure_stops,
                 }
                 import json as _json
                 return [
